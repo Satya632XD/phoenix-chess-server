@@ -22,11 +22,23 @@ mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected permanently to MongoDB Atlas Cloud!'))
   .catch(err => console.error('❌ Database connection crash:', err.message));
 
-// Define User Schema for MongoDB Collections
+// ─── SESSION SCHEMA FOR PERMANENT STORAGE ───────────────────────────────
+const SessionSchema = new mongoose.Schema({
+  token: { type: String, required: true, unique: true, index: true },
+  username: { type: String, required: true, lowercase: true },
+  createdAt: { type: Date, default: Date.now, expires: 604800 }, // 7 days TTL
+  lastActivity: { type: Date, default: Date.now },
+  ipAddress: String,
+  userAgent: String
+});
+
+const Session = mongoose.model('Session', SessionSchema);
+
+// ─── USER SCHEMA (UNCHANGED - GOOD!) ─────────────────────────────────────
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true, lowercase: true },
   passwordHash: { type: String, required: true },
-  email: { type: String, default: null, lowercase: true },
+  email: { type: String, default: null, lowercase: true, unique: true, sparse: true },
   phone: { type: String, default: null },
   displayName: String,
   bio: { type: String, default: '' },
@@ -51,8 +63,32 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', UserSchema);
 
-// Memory containers for active items
-const sessions = {};
+// ─── ANALYSIS SCHEMA FOR MOVE ANALYSIS ──────────────────────────────────
+const AnalysisSchema = new mongoose.Schema({
+  gameId: { type: String, required: true, unique: true },
+  moves: [{
+    moveNumber: Number,
+    san: String,
+    from: String,
+    to: String,
+    color: String,
+    eval: Number,
+    depth: Number,
+    bestMove: String,
+    bestEval: Number,
+    classification: String, // Best, Good, Decent, Inaccuracy, Mistake, Blunder, Brilliant
+    explanation: String,
+    tacticalPattern: String, // e.g., "Pin", "Fork", "Skewer", "Sacrifice"
+    positionalAssessment: String
+  }],
+  overallAccuracy: Number,
+  engineDepth: { type: Number, default: 20 },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Analysis = mongoose.model('Analysis', AnalysisSchema);
+
+// Memory containers for active items (games only - sessions are in DB)
 const games = {};
 const waitingPlayers = { normal: [], phoenix: [] };
 
@@ -166,11 +202,25 @@ function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-function authMiddleware(req, res, next) {
+// ─── UPDATED MIDDLEWARE - CHECKS DATABASE FOR SESSIONS ──────────────────
+async function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token || !sessions[token]) return res.status(401).json({ error: 'Unauthorized' });
-  req.username = sessions[token];
-  next();
+  if (!token) return res.status(401).json({ error: 'Unauthorized - No token' });
+  
+  try {
+    const session = await Session.findOne({ token });
+    if (!session) return res.status(401).json({ error: 'Unauthorized - Invalid or expired token' });
+    
+    // Update last activity
+    session.lastActivity = new Date();
+    await session.save();
+    
+    req.username = session.username;
+    req.token = token;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Unauthorized - Session check failed' });
+  }
 }
 
 function sanitizeUser(user) {
@@ -197,7 +247,7 @@ function generatePGN(game, result) {
   return `[Event "Phoenix Chess Game"]\n[Site "phoenix-chess.com"]\n[Date "${dateStr}"]\n[White "${game.usernames.w}"]\n[Black "${game.usernames.b}"]\n[Result "${pgnResult}"]\n[TimeControl "${game.timerSeconds}+${game.increment}"]\n\n${moves} ${pgnResult}`;
 }
 
-// ─── Auth routes ──────────────────────────────────────────────────────────
+// ─── REGISTER - NOW SAVES SESSION TO DATABASE ────────────────────────────
 app.post('/auth/register', async (req, res) => {
   const { username, password, email, phone } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
@@ -217,15 +267,24 @@ app.post('/auth/register', async (req, res) => {
     const dbUser = new User(userObj);
     await dbUser.save();
 
+    // ✅ CREATE SESSION IN DATABASE (PERMANENT)
     const token = generateToken();
-    sessions[token] = username.toLowerCase();
+    const session = new Session({
+      token,
+      username: username.toLowerCase(),
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent']
+    });
+    await session.save();
     
     res.json({ token, user: sanitizeUser(dbUser.toObject()) });
   } catch (err) {
+    console.error('Registration error:', err);
     res.status(500).json({ error: 'Internal Server Error during registration' });
   }
 });
 
+// ─── LOGIN - NOW SAVES SESSION TO DATABASE ───────────────────────────────
 app.post('/auth/login', async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -241,28 +300,50 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    // ✅ CREATE SESSION IN DATABASE (PERMANENT)
     const token = generateToken();
-    sessions[token] = user.username.toLowerCase();
+    const session = new Session({
+      token,
+      username: user.username.toLowerCase(),
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent']
+    });
+    await session.save();
     
     res.json({ token, user: sanitizeUser(user.toObject()) });
   } catch (err) {
+    console.error('Login error:', err);
     res.status(500).json({ error: 'Internal Server Error during login' });
   }
 });
 
-app.post('/auth/logout', authMiddleware, (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  delete sessions[token];
-  res.json({ success: true });
+// ─── LOGOUT - NOW REMOVES SESSION FROM DATABASE ──────────────────────────
+app.post('/auth/logout', authMiddleware, async (req, res) => {
+  try {
+    await Session.deleteOne({ token: req.token });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Logout failed' });
+  }
 });
 
-// ─── Profile routes ───────────────────────────────────────────────────────
+// ─── VERIFY TOKEN - KEEP TOKENS ALIVE ────────────────────────────────────
+app.post('/auth/verify', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.username });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ valid: true, user: sanitizeUser(user.toObject()) });
+  } catch (err) {
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+// ─── PROFILE ROUTES ───────────────────────────────────────────────────────
 app.get('/profile/me', authMiddleware, async (req, res) => {
   try {
     const user = await User.findOne({ username: req.username });
     if (!user) return res.status(404).json({ error: 'User not found' });
     
-    // Safety check for schema structural synchronization
     let modified = false;
     if (!user.ratings?.normal?.bullet_30s) {
       user.ratings.normal = { ...defaultNormalRatings(), ...user.ratings.normal };
@@ -317,7 +398,7 @@ app.patch('/profile/me', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Leaderboard ──────────────────────────────────────────────────────────
+// ─── LEADERBOARD ──────────────────────────────────────────────────────────
 app.get('/leaderboard/:mode/:cat', async (req, res) => {
   const { mode, cat } = req.params;
   try {
@@ -342,7 +423,7 @@ app.get('/leaderboard/:mode/:cat', async (req, res) => {
   }
 });
 
-// ─── Match history ────────────────────────────────────────────────────────
+// ─── MATCH HISTORY ────────────────────────────────────────────────────────
 app.get('/history/:username', async (req, res) => {
   try {
     const user = await User.findOne({ username: req.params.username.toLowerCase() });
@@ -382,6 +463,38 @@ app.get('/game/:gameId', async (req, res) => {
   }
 });
 
+// ─── ANALYSIS ROUTES (NEW) ────────────────────────────────────────────────
+app.get('/analysis/:gameId', async (req, res) => {
+  try {
+    const analysis = await Analysis.findOne({ gameId: req.params.gameId });
+    if (!analysis) return res.status(404).json({ error: 'Analysis not found' });
+    res.json(analysis);
+  } catch (err) {
+    res.status(500).json({ error: 'Error fetching analysis' });
+  }
+});
+
+app.post('/analysis/:gameId', authMiddleware, async (req, res) => {
+  try {
+    const { moves, overallAccuracy, engineDepth } = req.body;
+    const { gameId } = req.params;
+    
+    let analysis = await Analysis.findOne({ gameId });
+    if (!analysis) {
+      analysis = new Analysis({ gameId, moves, overallAccuracy, engineDepth });
+    } else {
+      analysis.moves = moves;
+      analysis.overallAccuracy = overallAccuracy;
+      analysis.engineDepth = engineDepth;
+    }
+    
+    await analysis.save();
+    res.json(analysis);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to save analysis' });
+  }
+});
+
 app.patch('/game/:gameId/notes', authMiddleware, async (req, res) => {
   const { gameId } = req.params;
   const { notes } = req.body;
@@ -402,19 +515,21 @@ app.patch('/game/:gameId/notes', authMiddleware, async (req, res) => {
   }
 });
 
-// ─── Health check ─────────────────────────────────────────────────────────
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────
 app.get('/', async (req, res) => {
   let dbActive = mongoose.connection.readyState === 1;
   let userCount = dbActive ? await User.countDocuments({}) : 0;
+  let sessionCount = dbActive ? await Session.countDocuments({}) : 0;
   res.json({
     status: 'Phoenix Chess Server running ✅',
     players: userCount,
+    activeSessions: sessionCount,
     activeGames: Object.keys(games).length,
     databaseConnected: dbActive
   });
 });
 
-// ─── Matchmaking ──────────────────────────────────────────────────────────
+// ─── MATCHMAKING ──────────────────────────────────────────────────────────
 function createGame(socket1, socket2, mode, timerSeconds, increment) {
   const gameId = Math.random().toString(36).substring(2, 8).toUpperCase();
   const chess = new Chess();
@@ -581,61 +696,73 @@ async function endGame(gameId, result, reason, winnerColor, loserColor) {
   delete games[gameId];
 }
 
-// ─── Socket.io ────────────────────────────────────────────────────────────
+// ─── SOCKET.IO ────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('Connected:', socket.id);
 
   socket.on('authenticate', async ({ token }) => {
-    const username = sessions[token];
-    if (username) {
-      const user = await User.findOne({ username });
-      if (user) {
-        socket.username = username;
-        socket.emit('authenticated', { username, user: sanitizeUser(user.toObject()) });
+    try {
+      const session = await Session.findOne({ token });
+      if (session) {
+        const user = await User.findOne({ username: session.username });
+        if (user) {
+          socket.username = session.username;
+          socket.emit('authenticated', { username: session.username, user: sanitizeUser(user.toObject()) });
+        }
       }
+    } catch (err) {
+      console.error('Auth error:', err);
     }
   });
 
   socket.on('findGame', async ({ mode, timerSeconds, increment, token }) => {
-    if (token && sessions[token]) socket.username = sessions[token];
-    const modeKey = mode === 'phoenix' ? 'phoenix' : 'normal';
-    const queue = waitingPlayers[modeKey];
+    try {
+      if (token) {
+        const session = await Session.findOne({ token });
+        if (session) socket.username = session.username;
+      }
+      
+      const modeKey = mode === 'phoenix' ? 'phoenix' : 'normal';
+      const queue = waitingPlayers[modeKey];
 
-    if (queue.length > 0) {
-      const opponent = queue.shift();
-      const { gameId, colors } = createGame(socket, opponent, modeKey, timerSeconds || 600, increment || 0);
-      const game = games[gameId];
-      socket.join(gameId);
-      opponent.join(gameId);
+      if (queue.length > 0) {
+        const opponent = queue.shift();
+        const { gameId, colors } = createGame(socket, opponent, modeKey, timerSeconds || 600, increment || 0);
+        const game = games[gameId];
+        socket.join(gameId);
+        opponent.join(gameId);
 
-      const getInfo = async (un) => {
-        if (!un) return null;
-        const u = await User.findOne({ username: un });
-        if (!u) return null;
-        const { cat } = game.timeKey;
-        return {
-          username: u.username,
-          displayName: u.displayName,
-          flair: u.flair,
-          rating: u.ratings[modeKey][cat] || 400,
-          tier: getTier(u.ratings[modeKey][cat] || 400),
+        const getInfo = async (un) => {
+          if (!un) return null;
+          const u = await User.findOne({ username: un });
+          if (!u) return null;
+          const { cat } = game.timeKey;
+          return {
+            username: u.username,
+            displayName: u.displayName,
+            flair: u.flair,
+            rating: u.ratings[modeKey][cat] || 400,
+            tier: getTier(u.ratings[modeKey][cat] || 400),
+          };
         };
-      };
 
-      socket.emit('gameFound', {
-        gameId, color: colors[socket.id], timers: game.timers,
-        opponent: await getInfo(opponent.username), category: game.category,
-      });
-      opponent.emit('gameFound', {
-        gameId, color: colors[opponent.id], timers: game.timers,
-        opponent: await getInfo(socket.username), category: game.category,
-      });
+        socket.emit('gameFound', {
+          gameId, color: colors[socket.id], timers: game.timers,
+          opponent: await getInfo(opponent.username), category: game.category,
+        });
+        opponent.emit('gameFound', {
+          gameId, color: colors[opponent.id], timers: game.timers,
+          opponent: await getInfo(socket.username), category: game.category,
+        });
 
-      game.started = true;
-      startTimer(gameId);
-    } else {
-      waitingPlayers[modeKey].push(socket);
-      socket.emit('waiting');
+        game.started = true;
+        startTimer(gameId);
+      } else {
+        waitingPlayers[modeKey].push(socket);
+        socket.emit('waiting');
+      }
+    } catch (err) {
+      console.error('Find game error:', err);
     }
   });
 
@@ -714,4 +841,5 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🚀 Phoenix Chess Server running on port ${PORT}`);
   console.log(`🌍 Data synced to Cloud Database Cluster`);
+  console.log(`📊 Sessions stored in MongoDB for persistence`);
 });
