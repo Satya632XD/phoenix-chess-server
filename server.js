@@ -22,6 +22,32 @@ mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected permanently to MongoDB Atlas Cloud!'))
   .catch(err => console.error('❌ Database connection crash:', err.message));
 
+// ─── HELPER FUNCTIONS (DEFINED FIRST!) ────────────────────────────────────
+function defaultNormalRatings() {
+  return {
+    bullet_30s: 400, bullet_1m: 400, bullet_2m: 400, bullet_2p3: 400,
+    blitz_3m: 400, blitz_5m: 400, blitz_5p5: 400,
+    rapid_7m: 400, rapid_10m: 400, rapid_15m: 400, rapid_15p5: 400,
+    classical_30m: 400,
+  };
+}
+
+function defaultPhoenixRatings() {
+  return {
+    blitz_4m: 400, blitz_5m: 400, blitz_5p6: 400,
+    rapid_7m: 400, rapid_10m: 400, rapid_15m: 400, rapid_15p5: 400,
+    classical_30m: 400,
+  };
+}
+
+function hashPassword(password) {
+  return crypto.createHash('sha256').update(password).digest('hex');
+}
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
 // ─── SESSION SCHEMA FOR PERMANENT STORAGE ───────────────────────────────
 const SessionSchema = new mongoose.Schema({
   token: { type: String, required: true, unique: true, index: true },
@@ -34,7 +60,7 @@ const SessionSchema = new mongoose.Schema({
 
 const Session = mongoose.model('Session', SessionSchema);
 
-// ─── USER SCHEMA (UNCHANGED - GOOD!) ─────────────────────────────────────
+// ─── USER SCHEMA ─────────────────────────────────────────────────────────
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true, lowercase: true },
   passwordHash: { type: String, required: true },
@@ -47,8 +73,8 @@ const UserSchema = new mongoose.Schema({
   flair: { type: String, default: '' },
   profilePic: { type: String, default: null },
   createdAt: { type: Number, default: Date.now },
-  ratings: { type: mongoose.Schema.Types.Mixed, default: defaultNormalRatings },
-  peakRatings: { type: mongoose.Schema.Types.Mixed, default: defaultNormalRatings },
+  ratings: { type: mongoose.Schema.Types.Mixed, default: () => ({ normal: defaultNormalRatings(), phoenix: defaultPhoenixRatings() }) },
+  peakRatings: { type: mongoose.Schema.Types.Mixed, default: () => ({ normal: defaultNormalRatings(), phoenix: defaultPhoenixRatings() }) },
   stats: { 
     type: mongoose.Schema.Types.Mixed, 
     default: () => ({
@@ -146,23 +172,6 @@ function calcElo(playerRating, opponentRating, result) {
   return Math.round(playerRating + K * (result - expected));
 }
 
-function defaultNormalRatings() {
-  return {
-    bullet_30s: 400, bullet_1m: 400, bullet_2m: 400, bullet_2p3: 400,
-    blitz_3m: 400, blitz_5m: 400, blitz_5p5: 400,
-    rapid_7m: 400, rapid_10m: 400, rapid_15m: 400, rapid_15p5: 400,
-    classical_30m: 400,
-  };
-}
-
-function defaultPhoenixRatings() {
-  return {
-    blitz_4m: 400, blitz_5m: 400, blitz_5p6: 400,
-    rapid_7m: 400, rapid_10m: 400, rapid_15m: 400, rapid_15p5: 400,
-    classical_30m: 400,
-  };
-}
-
 function createUser(username, passwordHash, email, phone) {
   return {
     username,
@@ -194,35 +203,6 @@ function createUser(username, passwordHash, email, phone) {
   };
 }
 
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(password).digest('hex');
-}
-
-function generateToken() {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-// ─── UPDATED MIDDLEWARE - CHECKS DATABASE FOR SESSIONS ──────────────────
-async function authMiddleware(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Unauthorized - No token' });
-  
-  try {
-    const session = await Session.findOne({ token });
-    if (!session) return res.status(401).json({ error: 'Unauthorized - Invalid or expired token' });
-    
-    // Update last activity
-    session.lastActivity = new Date();
-    await session.save();
-    
-    req.username = session.username;
-    req.token = token;
-    next();
-  } catch (err) {
-    res.status(401).json({ error: 'Unauthorized - Session check failed' });
-  }
-}
-
 function sanitizeUser(user) {
   const { passwordHash, ...safe } = user;
   return safe;
@@ -245,6 +225,27 @@ function generatePGN(game, result) {
     .join(' ');
   
   return `[Event "Phoenix Chess Game"]\n[Site "phoenix-chess.com"]\n[Date "${dateStr}"]\n[White "${game.usernames.w}"]\n[Black "${game.usernames.b}"]\n[Result "${pgnResult}"]\n[TimeControl "${game.timerSeconds}+${game.increment}"]\n\n${moves} ${pgnResult}`;
+}
+
+// ─── UPDATED MIDDLEWARE - CHECKS DATABASE FOR SESSIONS ──────────────────
+async function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Unauthorized - No token' });
+  
+  try {
+    const session = await Session.findOne({ token });
+    if (!session) return res.status(401).json({ error: 'Unauthorized - Invalid or expired token' });
+    
+    // Update last activity
+    session.lastActivity = new Date();
+    await session.save();
+    
+    req.username = session.username;
+    req.token = token;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Unauthorized - Session check failed' });
+  }
 }
 
 // ─── REGISTER - NOW SAVES SESSION TO DATABASE ────────────────────────────
