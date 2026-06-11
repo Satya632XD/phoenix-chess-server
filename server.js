@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -16,8 +17,7 @@ const io = new Server(server, {
 });
 
 // ─── MONGOOSE PERMANENT DATABASE INTEGRATION ───────────────────────────
-const MONGO_URI = "mongodb+srv://phoenix_admin:Satya123@cluster0.jebirhm.mongodb.net/phoenix_chess?retryWrites=true&w=majority";
-
+const MONGO_URI = process.env.MONGO_URI;
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected permanently to MongoDB Atlas Cloud!'))
   .catch(err => console.error('❌ Database connection crash:', err.message));
