@@ -64,7 +64,8 @@ const Session = mongoose.model('Session', SessionSchema);
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true, lowercase: true },
   passwordHash: { type: String, required: true },
-  email: { type: String, default: null, lowercase: true, unique: true, sparse: true },
+  // Remapped unique and sparse constraints out of this field definition
+  email: { type: String, default: null, lowercase: true },
   phone: { type: String, default: null },
   displayName: String,
   bio: { type: String, default: '' },
@@ -86,6 +87,17 @@ const UserSchema = new mongoose.Schema({
   winStreak: { type: Number, default: 0 },
   bestWinStreak: { type: Number, default: 0 }
 }, { minimize: false });
+
+// ─── ROBUST FIX: PARTIAL FILTER UNIQUE INDEX FOR EMAIL ─────────────────────
+// This ensures that uniqueness is ONLY enforced when the email field is an actual string.
+// Multiple 'null' values will no longer clash or trigger E11000 index conflicts.
+UserSchema.index(
+  { email: 1 },
+  { 
+    unique: true, 
+    partialFilterExpression: { email: { $type: "string" } } 
+  }
+);
 
 const User = mongoose.model('User', UserSchema);
 
